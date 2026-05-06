@@ -1,70 +1,104 @@
 """Mock cron consumer charm – used in scheduler integration tests.
 
-Registers two jobs (``test-job-foo`` and ``test-job-bar``) so the integration
-test covers the multi-job case.
+Registers two jobs, each on its own named endpoint:
+  - ``cron-foo`` endpoint → job ``test-job-foo``
+  - ``cron-bar`` endpoint → job ``test-job-bar``
 
-Protocol (``cron`` relation):
-  - On ``cron-relation-joined``: publish ``jobs`` with both job schedules.
-  - On ``cron-relation-changed``: for each ``trigger-<job>`` key in the
-    scheduler's databag, compare it against the consumer's stored
-    ``ack-<job>`` value.  A mismatch means the job has newly fired; run it
-    and respond with ``<job>: done`` plus ``ack-<job>: <same timestamp>``.
+Each endpoint uses ``interface: cron`` so Juju maps it to the scheduler's
+``cron`` provide endpoint as a separate relation.
 
-The ``ack-<job>`` key lets the consumer identify exactly which jobs fired
-without relying on which key triggered the relation-changed event.
+Protocol (``cron`` interface, one relation per job):
+  - On ``<endpoint>-relation-joined``: publish ``job-name`` and ``cron`` for
+    the single job assigned to that endpoint.
+  - On ``<endpoint>-relation-changed``: check the scheduler's ``trigger-<job>``
+    key. If it differs from the stored ``ack-<job>``, the job has newly fired;
+    respond with ``<job>: done`` and ``ack-<job>: <same timestamp>``.
+
+The ``ack-<job>`` key lets the consumer identify which triggers are new
+without relying on which key caused the relation-changed event.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 
 import ops
 
 logger = logging.getLogger(__name__)
 
-JOBS = {
-    "test-job-foo": "* * * * *",
-    "test-job-bar": "* * * * *",
-}
+CRON_EXPR = "* * * * *"
+JOB_FOO = "test-job-foo"
+JOB_BAR = "test-job-bar"
 
 
 class MockCronConsumerCharm(ops.CharmBase):
     def __init__(self, *args):
         super().__init__(*args)
         self.framework.observe(self.on.install, self._on_install)
-        self.framework.observe(self.on.cron_relation_joined, self._on_cron_relation_joined)
-        self.framework.observe(self.on.cron_relation_changed, self._on_cron_relation_changed)
+
+        self.framework.observe(self.on.cron_foo_relation_joined, self._on_cron_foo_relation_joined)
+        self.framework.observe(self.on.cron_foo_relation_changed, self._on_cron_foo_relation_changed)
+
+        self.framework.observe(self.on.cron_bar_relation_joined, self._on_cron_bar_relation_joined)
+        self.framework.observe(self.on.cron_bar_relation_changed, self._on_cron_bar_relation_changed)
 
     def _on_install(self, _event: ops.InstallEvent) -> None:
         self.unit.status = ops.ActiveStatus("Ready")
 
-    def _on_cron_relation_joined(self, event: ops.RelationJoinedEvent) -> None:
-        event.relation.data[self.unit]["jobs"] = json.dumps(JOBS)
-        logger.info("Registered jobs %s with scheduler", list(JOBS))
+    # ------------------------------------------------------------------
+    # cron-foo (test-job-foo)
+    # ------------------------------------------------------------------
+
+    def _on_cron_foo_relation_joined(self, event: ops.RelationJoinedEvent) -> None:
+        event.relation.data[self.unit]["job-name"] = JOB_FOO
+        event.relation.data[self.unit]["cron"] = CRON_EXPR
+        logger.info("Registered job %s on cron-foo", JOB_FOO)
         self.unit.status = ops.ActiveStatus("Waiting for trigger")
 
-    def _on_cron_relation_changed(self, event: ops.RelationChangedEvent) -> None:
+    def _on_cron_foo_relation_changed(self, event: ops.RelationChangedEvent) -> None:
+        self._handle_trigger(event, JOB_FOO)
+
+    # ------------------------------------------------------------------
+    # cron-bar (test-job-bar)
+    # ------------------------------------------------------------------
+
+    def _on_cron_bar_relation_joined(self, event: ops.RelationJoinedEvent) -> None:
+        event.relation.data[self.unit]["job-name"] = JOB_BAR
+        event.relation.data[self.unit]["cron"] = CRON_EXPR
+        logger.info("Registered job %s on cron-bar", JOB_BAR)
+        self.unit.status = ops.ActiveStatus("Waiting for trigger")
+
+    def _on_cron_bar_relation_changed(self, event: ops.RelationChangedEvent) -> None:
+        self._handle_trigger(event, JOB_BAR)
+
+    # ------------------------------------------------------------------
+    # Shared trigger handler
+    # ------------------------------------------------------------------
+
+    def _handle_trigger(self, event: ops.RelationChangedEvent, job_name: str) -> None:
         scheduler_units = [u for u in event.relation.units if "scheduler" in u.app.name]
         for sched_unit in scheduler_units:
             sched_data = event.relation.data[sched_unit]
             our_data = event.relation.data[self.unit]
 
-            for key, trigger_ts in sched_data.items():
-                if not key.startswith("trigger-"):
-                    continue
-                job_name = key[len("trigger-"):]
-                ack_key = f"ack-{job_name}"
+            trigger_ts = sched_data.get(f"trigger-{job_name}")
+            if trigger_ts is None:
+                continue
+            if our_data.get(f"ack-{job_name}") == trigger_ts:
+                continue  # already processed this trigger
 
-                if our_data.get(ack_key) == trigger_ts:
-                    continue  # already processed this trigger
+            logger.info("New trigger for job %s – reporting done", job_name)
+            our_data[job_name] = "done"
+            our_data[f"ack-{job_name}"] = trigger_ts
 
-                logger.info("New trigger for job %s – reporting done", job_name)
-                our_data[job_name] = "done"
-                our_data[ack_key] = trigger_ts
+        self._update_status()
 
-        done_jobs = [j for j in JOBS if event.relation.data[self.unit].get(j) == "done"]
-        if len(done_jobs) == len(JOBS):
+    def _update_status(self) -> None:
+        foo_rel = self.model.get_relation("cron-foo")
+        bar_rel = self.model.get_relation("cron-bar")
+        foo_done = foo_rel is not None and foo_rel.data[self.unit].get(JOB_FOO) == "done"
+        bar_done = bar_rel is not None and bar_rel.data[self.unit].get(JOB_BAR) == "done"
+        if foo_done and bar_done:
             self.unit.status = ops.ActiveStatus("all jobs executed successfully")
 
 

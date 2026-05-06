@@ -4,10 +4,12 @@ Tests run in file order with ``--exitfirst`` so a failure stops the suite.
 
 Flow:
   1. Deploy both charms (scheduler + mock-cron-consumer).
-  2. Integrate them via the ``cron`` relation.
+  2. Integrate them via two separate ``cron`` relations — one per job:
+       scheduler:cron ↔ mock-consumer:cron-foo  (test-job-foo)
+       scheduler:cron ↔ mock-consumer:cron-bar  (test-job-bar)
   3. Wait for the scheduler APScheduler daemon to fire (``* * * * *`` = every minute).
   4. Assert both jobs (test-job-foo, test-job-bar) are triggered in the
-     scheduler databag.
+     scheduler databag (one relation per job).
   5. Assert the consumer processes each job independently using the
      ``ack-<job>`` pattern and reports ``<job>: done`` for both.
 """
@@ -33,12 +35,20 @@ APP_CONSUMER = "mock-consumer"
 
 JOBS = ["test-job-foo", "test-job-bar"]
 
+# Mapping: job name → consumer endpoint name
+JOB_ENDPOINTS = {
+    "test-job-foo": "cron-foo",
+    "test-job-bar": "cron-bar",
+}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _get_unit_relation_data(juju: jubilant.Juju, unit: str, endpoint: str) -> dict:
+def _get_unit_relation_data(
+    juju: jubilant.Juju, unit: str, endpoint: str
+) -> dict:
     """Return the local-unit relation databag for *unit* on *endpoint*."""
     raw = juju.cli("show-unit", unit, "--format", "json")
     unit_info = json.loads(raw).get(unit, {})
@@ -100,50 +110,61 @@ def test_deploy(
 
 
 def test_relate(juju: jubilant.Juju) -> None:
-    """Integrate the charms and wait for idle."""
-    juju.integrate(APP_SCHEDULER, APP_CONSUMER)
+    """Integrate the charms with two separate relations, one per job."""
+    juju.integrate(f"{APP_SCHEDULER}:cron", f"{APP_CONSUMER}:cron-foo")
+    juju.integrate(f"{APP_SCHEDULER}:cron", f"{APP_CONSUMER}:cron-bar")
     juju.wait(
         jubilant.all_agents_idle,
         error=jubilant.any_error,
         timeout=120,
     )
-    logger.info("Charms integrated and idle")
+    logger.info("Charms integrated (cron-foo and cron-bar) and idle")
 
 
 def test_cron_fires(juju: jubilant.Juju) -> None:
-    """Wait for the scheduler daemon to fire and set trigger keys for all jobs."""
+    """Wait for the scheduler daemon to fire and set trigger keys for all jobs.
 
+    Each job lives on its own relation (cron endpoint on the scheduler side).
+    We check that ``trigger-<job>`` appears in at least one scheduler relation.
+    """
     def _all_triggers_set() -> bool:
-        data = _get_unit_relation_data(juju, f"{APP_SCHEDULER}/0", "cron")
-        return all(f"trigger-{job}" in data for job in JOBS)
+        raw = juju.cli("show-unit", f"{APP_SCHEDULER}/0", "--format", "json")
+        unit_info = json.loads(raw).get(f"{APP_SCHEDULER}/0", {})
+        triggered = set()
+        for rel_info in unit_info.get("relation-info", []):
+            if rel_info.get("endpoint") != "cron":
+                continue
+            data = rel_info.get("local-unit", {}).get("data", {})
+            for job in JOBS:
+                if f"trigger-{job}" in data:
+                    triggered.add(job)
+        return triggered == set(JOBS)
 
     fired = _poll(_all_triggers_set, description="all trigger keys in scheduler databag")
-    scheduler_data = _get_unit_relation_data(juju, f"{APP_SCHEDULER}/0", "cron")
-    assert fired, (
-        f"scheduler did not set all trigger keys within the timeout. "
-        f"Current scheduler unit data: {scheduler_data}"
-    )
+    assert fired, "Scheduler did not set all trigger keys within the timeout."
     for job in JOBS:
-        logger.info("trigger-%s = %s", job, scheduler_data.get(f"trigger-{job}"))
+        logger.info("trigger-%s fired for job %s", job, job)
 
 
 def test_consumer_responds(juju: jubilant.Juju) -> None:
-    """Wait for the consumer to respond with <job>: done and ack-<job> for all jobs."""
+    """Wait for the consumer to respond with <job>: done and ack-<job> on each endpoint."""
 
     def _all_done() -> bool:
-        data = _get_unit_relation_data(juju, f"{APP_CONSUMER}/0", "cron")
-        return all(data.get(job) == "done" for job in JOBS)
+        for job, endpoint in JOB_ENDPOINTS.items():
+            data = _get_unit_relation_data(juju, f"{APP_CONSUMER}/0", endpoint)
+            if data.get(job) != "done":
+                return False
+        return True
 
     responded = _poll(_all_done, description="all jobs done in consumer databag")
-    consumer_data = _get_unit_relation_data(juju, f"{APP_CONSUMER}/0", "cron")
-    assert responded, (
-        f"mock consumer did not report all jobs done within the timeout. "
-        f"Current consumer unit data: {consumer_data}"
-    )
-    # Also verify the consumer wrote ack-<job> for each job (ack pattern)
-    for job in JOBS:
-        assert f"ack-{job}" in consumer_data, (
-            f"consumer missing ack-{job} in databag: {consumer_data}"
+    assert responded, "Mock consumer did not report all jobs done within the timeout."
+
+    for job, endpoint in JOB_ENDPOINTS.items():
+        data = _get_unit_relation_data(juju, f"{APP_CONSUMER}/0", endpoint)
+        assert data.get(job) == "done", f"consumer missing {job}=done on {endpoint}"
+        assert f"ack-{job}" in data, f"consumer missing ack-{job} on {endpoint}"
+        logger.info(
+            "[%s] %s=%s, ack-%s=%s",
+            endpoint, job, data.get(job), job, data.get(f"ack-{job}"),
         )
-        logger.info("%s = %s, ack-%s = %s", job, consumer_data.get(job), job, consumer_data.get(f"ack-{job}"))
 

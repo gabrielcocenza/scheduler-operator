@@ -5,7 +5,6 @@ Tests use ``ops.testing.Harness`` and do not require a live Juju environment.
 
 from __future__ import annotations
 
-import json
 import signal
 import sys
 import unittest
@@ -50,10 +49,10 @@ def _add_cron_relation(harness: ops.testing.Harness, remote_app: str = "mysql") 
 # ---------------------------------------------------------------------------
 
 class TestInstall(unittest.TestCase):
+    @patch("charm.service_restart")
     @patch("charm.SchedulerCharm._enable_service")
     @patch("charm.SchedulerCharm._render_systemd_unit")
-    @patch("charm.SchedulerCharm._install_python_deps")
-    def test_install_sets_active_status(self, _mock_install, _mock_render, _mock_enable):
+    def test_install_sets_active_status(self, _mock_render, _mock_enable, _mock_restart):
         harness = ops.testing.Harness(SchedulerCharm)
         with patch("charm.JOBS_FILE", new=Path("/tmp/test-jobs.json")):
             harness.begin_with_initial_hooks()
@@ -69,51 +68,56 @@ class TestCronRelationChanged(unittest.TestCase):
         self.harness = ops.testing.Harness(SchedulerCharm)
         self.harness.begin()
 
-    def _update_jobs(self, rel_id: int, remote_unit: str, jobs: dict) -> None:
-        with (
-            patch.object(self.harness.charm, "_write_jobs_file") as mock_write,
-            patch.object(self.harness.charm, "_sighup_daemon"),
-        ):
-            self.harness.update_relation_data(rel_id, remote_unit, {"jobs": json.dumps(jobs)})
-            return mock_write
-
     def test_single_job_registered(self):
         rel_id, remote_unit = _add_cron_relation(self.harness)
         with (
             patch.object(self.harness.charm, "_write_jobs_file") as mock_write,
-            patch.object(self.harness.charm, "_sighup_daemon"),
+            patch("charm.service_restart"),
         ):
             self.harness.update_relation_data(
-                rel_id, remote_unit, {"jobs": json.dumps({"backup": "0 2 * * *"})}
+                rel_id, remote_unit, {"job-name": "backup", "cron": "0 2 * * *"}
             )
         written = mock_write.call_args[0][0]
         job_id = f"{rel_id}:mysql/0:backup"
         self.assertIn(job_id, written)
         self.assertEqual(written[job_id]["cron"], "0 2 * * *")
 
-    def test_multiple_jobs_registered(self):
+    def test_no_registration_when_only_one_metadata_key_present(self):
+        """Only job-name without cron (or vice-versa) must not register a job."""
         rel_id, remote_unit = _add_cron_relation(self.harness)
-        jobs = {"backup": "0 2 * * *", "vacuum": "0 6 * * *"}
         with (
             patch.object(self.harness.charm, "_write_jobs_file") as mock_write,
-            patch.object(self.harness.charm, "_sighup_daemon"),
+            patch("charm.service_restart"),
         ):
-            self.harness.update_relation_data(rel_id, remote_unit, {"jobs": json.dumps(jobs)})
-        written = mock_write.call_args[0][0]
-        self.assertIn(f"{rel_id}:mysql/0:backup", written)
-        self.assertIn(f"{rel_id}:mysql/0:vacuum", written)
+            self.harness.update_relation_data(rel_id, remote_unit, {"job-name": "backup"})
+        # _write_jobs_file must not have been called (no valid job to register)
+        mock_write.assert_not_called()
 
-    def test_invalid_jobs_json_does_not_crash(self):
+    def test_metadata_keys_not_treated_as_job_responses(self):
+        """job-name and cron keys must never be processed as done/retry responses."""
         rel_id, remote_unit = _add_cron_relation(self.harness)
+        # Seed a trigger so we have something in our databag to compare against
+        harness = self.harness
+        harness.charm.model.get_relation("cron", rel_id).data[harness.charm.unit].update({
+            "trigger-backup": "2024-01-01T00:00:00+00:00",
+        })
+        initial_data = dict(harness.get_relation_data(rel_id, harness.charm.unit.name))
+
         with (
-            patch.object(self.harness.charm, "_write_jobs_file") as mock_write,
-            patch.object(self.harness.charm, "_sighup_daemon"),
+            patch.object(harness.charm, "_write_jobs_file"),
+            patch("charm.service_restart"),
         ):
-            self.harness.update_relation_data(rel_id, remote_unit, {"jobs": "not-json"})
-        written = mock_write.call_args[0][0]
-        self.assertEqual(written, {})
+            harness.update_relation_data(rel_id, remote_unit, {
+                "job-name": "backup",
+                "cron": "0 2 * * *",
+            })
+
+        final_data = harness.get_relation_data(rel_id, harness.charm.unit.name)
+        # Scheduler must not have written a new trigger-backup (metadata not a response)
+        self.assertEqual(initial_data.get("trigger-backup"), final_data.get("trigger-backup"))
 
     def test_multiple_relations_tracked_separately(self):
+        """Each relation registers its own job independently."""
         rel_id1, ru1 = _add_cron_relation(self.harness, "mysql")
         rel_id2, ru2 = _add_cron_relation(self.harness, "postgres")
         all_written: dict = {}
@@ -123,10 +127,10 @@ class TestCronRelationChanged(unittest.TestCase):
 
         with (
             patch.object(self.harness.charm, "_write_jobs_file", side_effect=capture_write),
-            patch.object(self.harness.charm, "_sighup_daemon"),
+            patch("charm.service_restart"),
         ):
-            self.harness.update_relation_data(rel_id1, ru1, {"jobs": json.dumps({"backup": "0 2 * * *"})})
-            self.harness.update_relation_data(rel_id2, ru2, {"jobs": json.dumps({"clean": "0 4 * * *"})})
+            self.harness.update_relation_data(rel_id1, ru1, {"job-name": "backup", "cron": "0 2 * * *"})
+            self.harness.update_relation_data(rel_id2, ru2, {"job-name": "clean", "cron": "0 4 * * *"})
 
         self.assertIn(f"{rel_id1}:mysql/0:backup", all_written)
         self.assertIn(f"{rel_id2}:postgres/0:clean", all_written)
@@ -150,9 +154,9 @@ class TestCronRelationDeparted(unittest.TestCase):
 
         with (
             patch.object(harness.charm, "_write_jobs_file", side_effect=capture_write),
-            patch.object(harness.charm, "_sighup_daemon"),
+            patch("charm.service_restart"),
         ):
-            harness.update_relation_data(rel_id, remote_unit, {"jobs": json.dumps({"backup": "0 2 * * *"})})
+            harness.update_relation_data(rel_id, remote_unit, {"job-name": "backup", "cron": "0 2 * * *"})
             harness.remove_relation_unit(rel_id, remote_unit)
 
         self.assertEqual(remaining[-1], {})
@@ -184,7 +188,7 @@ class TestJobResponse(unittest.TestCase):
 
         with (
             patch.object(harness.charm, "_write_jobs_file"),
-            patch.object(harness.charm, "_sighup_daemon"),
+            patch("charm.service_restart"),
         ):
             harness.update_relation_data(rel_id, remote_unit, {
                 "backup": "done",
@@ -201,7 +205,7 @@ class TestJobResponse(unittest.TestCase):
 
         with (
             patch.object(harness.charm, "_write_jobs_file"),
-            patch.object(harness.charm, "_sighup_daemon"),
+            patch("charm.service_restart"),
         ):
             # Only send ack-backup, no response key
             harness.update_relation_data(rel_id, remote_unit, {
@@ -218,7 +222,7 @@ class TestJobResponse(unittest.TestCase):
 
         with (
             patch.object(harness.charm, "_write_jobs_file"),
-            patch.object(harness.charm, "_sighup_daemon"),
+            patch("charm.service_restart"),
         ):
             harness.update_relation_data(rel_id, remote_unit, {
                 "backup": "retry",
@@ -230,26 +234,30 @@ class TestJobResponse(unittest.TestCase):
         self.assertIn("trigger-backup", our_data)
         self.assertNotEqual(our_data.get("trigger-backup"), ts)
 
-    def test_retry_multiple_jobs(self):
-        harness, rel_id, remote_unit = self._setup()
-        ts = self._seed_trigger(harness, rel_id, "backup")
-        self._seed_trigger(harness, rel_id, "vacuum")
+    def test_retry_and_done_on_separate_relations(self):
+        """Two jobs on separate relations: retry on one does not affect the other."""
+        harness = ops.testing.Harness(SchedulerCharm)
+        harness.begin()
+        rel_id1, ru1 = _add_cron_relation(harness, "mysql")
+        rel_id2, ru2 = _add_cron_relation(harness, "postgres")
+
+        ts = "2024-01-01T00:00:00+00:00"
+        harness.charm.model.get_relation("cron", rel_id1).data[harness.charm.unit].update({"trigger-backup": ts})
+        harness.charm.model.get_relation("cron", rel_id2).data[harness.charm.unit].update({"trigger-vacuum": ts})
 
         with (
             patch.object(harness.charm, "_write_jobs_file"),
-            patch.object(harness.charm, "_sighup_daemon"),
+            patch("charm.service_restart"),
         ):
-            harness.update_relation_data(rel_id, remote_unit, {
-                "backup": "retry",
-                "ack-backup": ts,
-                "vacuum": "done",
-                "ack-vacuum": ts,
-            })
+            harness.update_relation_data(rel_id1, ru1, {"backup": "retry", "ack-backup": ts})
+            harness.update_relation_data(rel_id2, ru2, {"vacuum": "done", "ack-vacuum": ts})
 
-        our_data = harness.get_relation_data(rel_id, harness.charm.unit.name)
-        # backup was retried (new timestamp); vacuum was done (no change)
-        self.assertNotEqual(our_data.get("trigger-backup"), ts)
-        self.assertEqual(our_data.get("trigger-vacuum"), ts)
+        data1 = harness.get_relation_data(rel_id1, harness.charm.unit.name)
+        data2 = harness.get_relation_data(rel_id2, harness.charm.unit.name)
+        # backup was retried on rel1 — trigger must be updated
+        self.assertNotEqual(data1.get("trigger-backup"), ts)
+        # vacuum was done on rel2 — trigger must be unchanged
+        self.assertEqual(data2.get("trigger-vacuum"), ts)
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +283,7 @@ class TestSchedulerService(unittest.TestCase):
 
     def test_load_jobs_valid(self):
         from scheduler_service import _load_jobs
+        import json
         p = Path("/tmp/good-jobs.json")
         data = {"1:mysql/0:backup": {"cron": "0 2 * * *"}}
         p.write_text(json.dumps(data))

@@ -16,7 +16,9 @@ bases:
         channel: "22.04"
 
 requires:
-  cron:
+  cron-foo:
+    interface: cron
+  cron-bar:
     interface: cron
 
 parts:

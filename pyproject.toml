@@ -5,6 +5,7 @@ requires-python = ">=3.10"
 dependencies = [
     "ops>=2.9.0",
     "apscheduler>=3.10.0,<4",
+    "charmlibs-systemd",
 ]
 
 [dependency-groups]

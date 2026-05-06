@@ -2,9 +2,12 @@
 
 Relation interface (``cron``):
 
+    Each relation carries exactly one job (one relation per job).
+
     Consumer unit databag (written by the consuming charm):
-        jobs:        JSON dict of {job-name: cron-expression}
-        <job>:       "done" | "retry"  – consumer's decision after each trigger
+        job-name:    the logical name of the scheduled job (string)
+        cron:        standard five-field cron expression (string)
+        <job-name>:  "done" | "retry"  – consumer's decision after each trigger
         ack-<job>:   the trigger timestamp the consumer is responding to;
                      used by the consumer to detect which jobs have newly fired
 
@@ -21,12 +24,11 @@ from __future__ import annotations
 import json
 import logging
 import os
-import signal
-import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
 import ops
+from charmlibs.systemd import daemon_reload, service_enable, service_restart
 
 logger = logging.getLogger(__name__)
 
@@ -74,10 +76,10 @@ class SchedulerCharm(ops.CharmBase):
             .replace("{{ timezone }}", timezone)
         )
         Path(SYSTEMD_UNIT).write_text(rendered)
-        subprocess.check_call(["systemctl", "daemon-reload"])
+        daemon_reload()
 
     def _enable_service(self) -> None:
-        subprocess.check_call(["systemctl", "enable", "--now", SERVICE_NAME])
+        service_enable("--now", SERVICE_NAME)
 
     # ------------------------------------------------------------------
     # Config changed
@@ -86,7 +88,7 @@ class SchedulerCharm(ops.CharmBase):
     def _on_config_changed(self, _event: ops.ConfigChangedEvent) -> None:
         self.unit.status = ops.MaintenanceStatus("Applying config")
         self._render_systemd_unit()
-        self._sighup_daemon()
+        service_restart(SERVICE_NAME)
         self.unit.status = ops.ActiveStatus("Ready")
 
     # ------------------------------------------------------------------
@@ -97,7 +99,7 @@ class SchedulerCharm(ops.CharmBase):
         """Handle relation data changes from the related unit.
 
         Two cases:
-        1. Related unit published/updated its ``jobs`` key → register new jobs.
+        1. Related unit published/updated ``job-name`` and ``cron`` keys → register the job.
         2. Related unit published a ``<job>: done | retry`` response → act accordingly.
         """
         remote_unit = event.unit
@@ -106,34 +108,39 @@ class SchedulerCharm(ops.CharmBase):
 
         remote_data = event.relation.data[remote_unit]
 
-        # --- Case 1: jobs key updated -----------------------------------
-        raw_jobs = remote_data.get("jobs")
-        if raw_jobs is not None:
-            try:
-                job_map = json.loads(raw_jobs)
-            except json.JSONDecodeError:
-                logger.warning("Invalid JSON in 'jobs' from %s", remote_unit.name)
-                job_map = {}
-            self._update_jobs_for_unit(event.relation, remote_unit, job_map)
+        _METADATA_KEYS = frozenset({"job-name", "cron"})
+        _JUJU_SYSTEM_KEYS = frozenset({"egress-subnets", "private-address", "ingress-address"})
+
+        # --- Case 1: job-name / cron keys updated -----------------------
+        job_name = remote_data.get("job-name")
+        cron_expr = remote_data.get("cron")
+        if job_name is not None and cron_expr is not None:
+            self._update_jobs_for_unit(event.relation, remote_unit, {job_name: cron_expr})
+        elif job_name is None and cron_expr is None:
+            pass  # no job metadata yet
+        else:
+            logger.warning(
+                "Relation %s/%s has only one of job-name/cron set; skipping registration",
+                event.relation.id, remote_unit.name,
+            )
 
         # --- Case 2: job responses (done / retry) -----------------------
         # Consumer writes ``<job>: done|retry`` and ``ack-<job>: <timestamp>``.
-        # Skip system keys, "jobs", and "ack-*" acknowledgement keys.
-        _JUJU_SYSTEM_KEYS = frozenset({"egress-subnets", "private-address", "ingress-address"})
+        # Skip system keys, metadata keys, and "ack-*" acknowledgement keys.
         for key, value in remote_data.items():
-            if key in _JUJU_SYSTEM_KEYS or key == "jobs" or key.startswith("ack-"):
+            if key in _JUJU_SYSTEM_KEYS or key in _METADATA_KEYS or key.startswith("ack-"):
                 continue
-            job_name = key
+            job_name_resp = key
             if value == "retry":
                 now = datetime.now(tz=timezone.utc).isoformat()
-                event.relation.data[self.unit][f"trigger-{job_name}"] = now
+                event.relation.data[self.unit][f"trigger-{job_name_resp}"] = now
                 logger.info(
                     "Consumer requested retry for job %s on relation %s",
-                    job_name, event.relation.id,
+                    job_name_resp, event.relation.id,
                 )
             elif value == "done":
                 logger.info(
-                    "Job %s completed on relation %s", job_name, event.relation.id
+                    "Job %s completed on relation %s", job_name_resp, event.relation.id
                 )
 
     def _on_cron_relation_departed(self, event: ops.RelationDepartedEvent) -> None:
@@ -160,32 +167,19 @@ class SchedulerCharm(ops.CharmBase):
             job_id = f"{relation.id}:{unit.name}:{job_name}"
             all_jobs[job_id] = {"cron": cron_expr}
         self._write_jobs_file(all_jobs)
-        self._sighup_daemon()
+        service_restart(SERVICE_NAME)
 
     def _remove_jobs_for_unit(self, relation: ops.Relation, unit: ops.Unit) -> None:
         all_jobs = _load_jobs_file()
         prefix = f"{relation.id}:{unit.name}:"
         all_jobs = {k: v for k, v in all_jobs.items() if not k.startswith(prefix)}
         self._write_jobs_file(all_jobs)
-        self._sighup_daemon()
+        service_restart(SERVICE_NAME)
 
     @staticmethod
     def _write_jobs_file(jobs: dict) -> None:
         JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
         JOBS_FILE.write_text(json.dumps(jobs, indent=2))
-
-    @staticmethod
-    def _sighup_daemon() -> None:
-        pid_file = Path(f"/run/{SERVICE_NAME}.pid")
-        if not pid_file.exists():
-            logger.debug("No PID file found for %s, skipping SIGHUP", SERVICE_NAME)
-            return
-        try:
-            pid = int(pid_file.read_text().strip())
-            os.kill(pid, signal.SIGHUP)
-            logger.info("Sent SIGHUP to %s (pid %d)", SERVICE_NAME, pid)
-        except (ValueError, ProcessLookupError, PermissionError) as exc:
-            logger.warning("Could not send SIGHUP to daemon: %s", exc)
 
 
 # ------------------------------------------------------------------
