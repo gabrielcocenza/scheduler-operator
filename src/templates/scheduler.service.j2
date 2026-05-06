@@ -1,0 +1,21 @@
+[Unit]
+Description=Juju Scheduler – APScheduler cron daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart={{ charm_dir }}/venv/bin/python {{ service_py }}
+Restart=on-failure
+RestartSec=5s
+PIDFile=/run/juju-scheduler.pid
+
+Environment=JUJU_UNIT_NAME={{ unit_name }}
+Environment=JOBS_FILE={{ jobs_file }}
+Environment=SCHEDULER_TIMEZONE={{ timezone }}
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=juju-scheduler
+
+[Install]
+WantedBy=multi-user.target

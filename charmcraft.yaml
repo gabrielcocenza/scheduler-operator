@@ -1,0 +1,40 @@
+name: scheduler
+type: charm
+title: Scheduler
+summary: >
+  Machine charm that lets related charms register named cron jobs and
+  receive a relation-changed trigger when each job fires.
+description: |
+  The scheduler charm runs an APScheduler daemon as a systemd service.
+  Related charms publish one or more named cron schedules (standard
+  five-field cron expressions) via their unit relation databag. When a
+  scheduled job fires, the scheduler charm updates its own side of the
+  relation databag, which causes Juju to fire relation-changed on the
+  remote unit. The remote charm then performs its scheduled action
+  (database backup, cache refresh, etc.) inside that hook.
+
+  Cross-model and k8s-charm consumption is supported transparently via
+  ``juju offer`` / ``juju consume``.
+
+assumes:
+  - juju >= 3.1
+
+bases:
+  - build-on:
+      - name: ubuntu
+        channel: "22.04"
+    run-on:
+      - name: ubuntu
+        channel: "22.04"
+
+provides:
+  cron:
+    interface: cron
+
+parts:
+  charm:
+    plugin: uv
+    source: .
+    uv-extras: []
+    build-snaps:
+      - astral-uv

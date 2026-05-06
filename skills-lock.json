@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "skills": {
+    "12factor-charm": {
+      "source": "canonical/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/12factor-charm/SKILL.md",
+      "computedHash": "f13bc4b997114a36724bd0375e09a776fe3b5fa5ce5a95fdd0aa8716b5e160d4"
+    },
+    "12factor-fit": {
+      "source": "canonical/skills",
+      "sourceType": "github",
+      "skillPath": "skills/engineering/12factor-fit/SKILL.md",
+      "computedHash": "32bf79c990f122fa5a55ac2b897ea9ce02541181568741cb706e3ff5e6e1e1d8"
+    },
+    "retrospective-artifacts": {
+      "source": "canonical/skills",
+      "sourceType": "github",
+      "skillPath": "skills/practices/retrospective-artifacts/SKILL.md",
+      "computedHash": "a0d6a37020fbfcb39739209b606adff2e1d51904b3d45e9131a73671129f3dcf"
+    }
+  }
+}

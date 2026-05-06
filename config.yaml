@@ -1,0 +1,7 @@
+options:
+  timezone:
+    type: string
+    default: "UTC"
+    description: >
+      Timezone used by APScheduler for all cron expressions.
+      Accepts any IANA timezone name, e.g. "America/Sao_Paulo".

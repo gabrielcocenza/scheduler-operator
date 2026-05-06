@@ -1,0 +1,28 @@
+name: mock-cron-consumer
+type: charm
+title: Mock Cron Consumer
+summary: Integration test helper – consumes the scheduler cron relation.
+description: |
+  Minimal charm used in scheduler integration tests. It registers a
+  ``* * * * *`` job on relation-joined and reports success on
+  relation-changed when the scheduler fires.
+
+bases:
+  - build-on:
+      - name: ubuntu
+        channel: "22.04"
+    run-on:
+      - name: ubuntu
+        channel: "22.04"
+
+requires:
+  cron:
+    interface: cron
+
+parts:
+  charm:
+    plugin: uv
+    source: .
+    uv-extras: []
+    build-snaps:
+      - astral-uv
