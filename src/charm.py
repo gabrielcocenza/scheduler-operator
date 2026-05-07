@@ -4,17 +4,21 @@ Relation interface (``cron``):
 
     Each relation carries exactly one job (one relation per job).
 
-    Consumer unit databag (written by the consuming charm):
+    Consumer **application** databag (written by the consumer leader):
         job-name:    the logical name of the scheduled job (string)
         cron:        standard five-field cron expression (string)
         <job-name>:  "done" | "retry"  – consumer's decision after each trigger
         ack-<job>:   the trigger timestamp the consumer is responding to;
                      used by the consumer to detect which jobs have newly fired
 
-    Scheduler unit databag (written by the APScheduler daemon via
-    ``relation-set``, or by this charm when re-triggering on retry):
+    Scheduler **application** databag (written by the APScheduler daemon via
+    ``relation-set --app``, or by this charm when re-triggering on retry):
         trigger-<job>:  ISO-8601 UTC timestamp; a new value causes Juju to
                         dispatch ``cron-relation-changed`` on the consumer
+
+Using application databags ensures a single consistent view regardless of
+how many units each application has. Only the leader unit may write to the
+application databag.
 
 The scheduler never limits retries. The consumer decides when it is done.
 """
@@ -45,7 +49,7 @@ class SchedulerCharm(ops.CharmBase):
         self.framework.observe(self.on.install, self._on_install)
         self.framework.observe(self.on.config_changed, self._on_config_changed)
         self.framework.observe(self.on.cron_relation_changed, self._on_cron_relation_changed)
-        self.framework.observe(self.on.cron_relation_departed, self._on_cron_relation_departed)
+        self.framework.observe(self.on.cron_relation_broken, self._on_cron_relation_broken)
 
     # ------------------------------------------------------------------
     # Install
@@ -96,44 +100,45 @@ class SchedulerCharm(ops.CharmBase):
     # ------------------------------------------------------------------
 
     def _on_cron_relation_changed(self, event: ops.RelationChangedEvent) -> None:
-        """Handle relation data changes from the related unit.
+        """Handle relation data changes from the consumer application.
+
+        Only the leader processes and responds to relation data changes.
 
         Two cases:
-        1. Related unit published/updated ``job-name`` and ``cron`` keys → register the job.
-        2. Related unit published a ``<job>: done | retry`` response → act accordingly.
+        1. Consumer published/updated ``job-name`` and ``cron`` keys → register the job.
+        2. Consumer published a ``<job>: done | retry`` response → act accordingly.
         """
-        remote_unit = event.unit
-        if remote_unit is None:
+        if not self.unit.is_leader():
             return
 
-        remote_data = event.relation.data[remote_unit]
+        remote_app_data = event.relation.data[event.app]
 
         _METADATA_KEYS = frozenset({"job-name", "cron"})
         _JUJU_SYSTEM_KEYS = frozenset({"egress-subnets", "private-address", "ingress-address"})
 
         # --- Case 1: job-name / cron keys updated -----------------------
-        job_name = remote_data.get("job-name")
-        cron_expr = remote_data.get("cron")
+        job_name = remote_app_data.get("job-name")
+        cron_expr = remote_app_data.get("cron")
         if job_name is not None and cron_expr is not None:
-            self._update_jobs_for_unit(event.relation, remote_unit, {job_name: cron_expr})
+            self._update_jobs_for_app(event.relation, event.app, {job_name: cron_expr})
         elif job_name is None and cron_expr is None:
             pass  # no job metadata yet
         else:
             logger.warning(
                 "Relation %s/%s has only one of job-name/cron set; skipping registration",
-                event.relation.id, remote_unit.name,
+                event.relation.id, event.app.name,
             )
 
         # --- Case 2: job responses (done / retry) -----------------------
         # Consumer writes ``<job>: done|retry`` and ``ack-<job>: <timestamp>``.
         # Skip system keys, metadata keys, and "ack-*" acknowledgement keys.
-        for key, value in remote_data.items():
+        for key, value in remote_app_data.items():
             if key in _JUJU_SYSTEM_KEYS or key in _METADATA_KEYS or key.startswith("ack-"):
                 continue
             job_name_resp = key
             if value == "retry":
                 now = datetime.now(tz=timezone.utc).isoformat()
-                event.relation.data[self.unit][f"trigger-{job_name_resp}"] = now
+                event.relation.data[self.app][f"trigger-{job_name_resp}"] = now
                 logger.info(
                     "Consumer requested retry for job %s on relation %s",
                     job_name_resp, event.relation.id,
@@ -143,35 +148,35 @@ class SchedulerCharm(ops.CharmBase):
                     "Job %s completed on relation %s", job_name_resp, event.relation.id
                 )
 
-    def _on_cron_relation_departed(self, event: ops.RelationDepartedEvent) -> None:
-        if event.departing_unit is None:
+    def _on_cron_relation_broken(self, event: ops.RelationBrokenEvent) -> None:
+        if not self.unit.is_leader():
             return
-        self._remove_jobs_for_unit(event.relation, event.departing_unit)
+        self._remove_jobs_for_app(event.relation, event.app)
 
     # ------------------------------------------------------------------
     # jobs.json management
     # ------------------------------------------------------------------
 
-    def _update_jobs_for_unit(
+    def _update_jobs_for_app(
         self,
         relation: ops.Relation,
-        unit: ops.Unit,
+        app: ops.Application,
         job_map: dict[str, str],
     ) -> None:
         all_jobs = _load_jobs_file()
-        prefix = f"{relation.id}:{unit.name}:"
-        # Remove stale jobs for this unit
+        prefix = f"{relation.id}:{app.name}:"
+        # Remove stale jobs for this app on this relation
         all_jobs = {k: v for k, v in all_jobs.items() if not k.startswith(prefix)}
         # Add/update
         for job_name, cron_expr in job_map.items():
-            job_id = f"{relation.id}:{unit.name}:{job_name}"
+            job_id = f"{relation.id}:{app.name}:{job_name}"
             all_jobs[job_id] = {"cron": cron_expr}
         self._write_jobs_file(all_jobs)
         service_restart(SERVICE_NAME)
 
-    def _remove_jobs_for_unit(self, relation: ops.Relation, unit: ops.Unit) -> None:
+    def _remove_jobs_for_app(self, relation: ops.Relation, app: ops.Application) -> None:
         all_jobs = _load_jobs_file()
-        prefix = f"{relation.id}:{unit.name}:"
+        prefix = f"{relation.id}:{app.name}:"
         all_jobs = {k: v for k, v in all_jobs.items() if not k.startswith(prefix)}
         self._write_jobs_file(all_jobs)
         service_restart(SERVICE_NAME)

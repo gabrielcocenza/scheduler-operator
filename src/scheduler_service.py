@@ -48,7 +48,12 @@ def _load_jobs(jobs_file: Path) -> dict:
 
 
 def _set_trigger(unit_name: str, relation_id: str, job_name: str) -> None:
-    """Write a trigger key to the scheduler's relation databag via relation-set.
+    """Write a trigger key to the scheduler's application relation databag via relation-set.
+
+    Using ``--app`` writes to the application databag so the trigger is visible
+    regardless of which scheduler unit a consumer queries. Only the leader unit
+    is permitted to write to the application databag; relation-set will fail
+    with a non-zero exit code on non-leader units, which is handled gracefully.
 
     Changing ``trigger-<job>`` causes Juju to dispatch ``cron-relation-changed``
     on the consumer unit, which should then run the job and respond with
@@ -59,7 +64,7 @@ def _set_trigger(unit_name: str, relation_id: str, job_name: str) -> None:
         JUJU_EXEC,
         "-u",
         unit_name,
-        f"relation-set -r {relation_id} trigger-{job_name}={now}",
+        f"relation-set --app -r {relation_id} trigger-{job_name}={now}",
     ]
     logger.info("Setting trigger for relation %s job %s", relation_id, job_name)
     try:

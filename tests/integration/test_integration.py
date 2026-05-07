@@ -46,28 +46,39 @@ JOB_ENDPOINTS = {
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _get_unit_relation_data(
+def _get_remote_app_data(
     juju: jubilant.Juju, unit: str, endpoint: str
 ) -> dict:
-    """Return the local-unit relation databag for *unit* on *endpoint*."""
+    """Return the **remote** application's relation databag as seen from *unit* on *endpoint*.
+
+    In Juju's ``show-unit`` output, ``application-data`` under ``relation-info`` contains
+    the *remote* application's databag (not the local one).  For example:
+    - ``show-unit mock-consumer/0`` → ``application-data`` = scheduler's data
+    - ``show-unit scheduler/0``     → ``application-data`` = consumer's data
+    """
     raw = juju.cli("show-unit", unit, "--format", "json")
     unit_info = json.loads(raw).get(unit, {})
     for rel_info in unit_info.get("relation-info", []):
         if rel_info.get("endpoint") == endpoint:
-            return rel_info.get("local-unit", {}).get("data", {})
+            return rel_info.get("application-data", {})
     return {}
 
 
-def _get_remote_unit_data(
-    juju: jubilant.Juju, unit: str, endpoint: str, remote_unit: str
-) -> dict:
-    """Return the remote-unit relation databag as seen from *unit*."""
+def _get_all_remote_app_data_by_endpoint(
+    juju: jubilant.Juju, unit: str, endpoint: str
+) -> list[dict]:
+    """Return all remote-app databags for every relation on *endpoint* for *unit*.
+
+    Useful when a unit has multiple relations on the same endpoint (e.g. ``scheduler/0``
+    has two ``cron`` relations).
+    """
     raw = juju.cli("show-unit", unit, "--format", "json")
     unit_info = json.loads(raw).get(unit, {})
-    for rel_info in unit_info.get("relation-info", []):
-        if rel_info.get("endpoint") == endpoint:
-            return rel_info.get("related-units", {}).get(remote_unit, {}).get("data", {})
-    return {}
+    return [
+        rel_info.get("application-data", {})
+        for rel_info in unit_info.get("relation-info", [])
+        if rel_info.get("endpoint") == endpoint
+    ]
 
 
 def _poll(
@@ -124,47 +135,54 @@ def test_relate(juju: jubilant.Juju) -> None:
 def test_cron_fires(juju: jubilant.Juju) -> None:
     """Wait for the scheduler daemon to fire and set trigger keys for all jobs.
 
-    Each job lives on its own relation (cron endpoint on the scheduler side).
-    We check that ``trigger-<job>`` appears in at least one scheduler relation.
+    Each job lives on its own relation. We check the scheduler's trigger keys by
+    reading from the consumer side: ``show-unit mock-consumer/0`` exposes the
+    scheduler's app databag under ``application-data`` for each consumer endpoint.
     """
     def _all_triggers_set() -> bool:
-        raw = juju.cli("show-unit", f"{APP_SCHEDULER}/0", "--format", "json")
-        unit_info = json.loads(raw).get(f"{APP_SCHEDULER}/0", {})
         triggered = set()
-        for rel_info in unit_info.get("relation-info", []):
-            if rel_info.get("endpoint") != "cron":
-                continue
-            data = rel_info.get("local-unit", {}).get("data", {})
-            for job in JOBS:
-                if f"trigger-{job}" in data:
-                    triggered.add(job)
+        for job, endpoint in JOB_ENDPOINTS.items():
+            data = _get_remote_app_data(juju, f"{APP_CONSUMER}/0", endpoint)
+            if f"trigger-{job}" in data:
+                triggered.add(job)
         return triggered == set(JOBS)
 
-    fired = _poll(_all_triggers_set, description="all trigger keys in scheduler databag")
+    fired = _poll(_all_triggers_set, description="all trigger keys in scheduler app databag")
     assert fired, "Scheduler did not set all trigger keys within the timeout."
     for job in JOBS:
-        logger.info("trigger-%s fired for job %s", job, job)
+        logger.info("trigger-%s fired", job)
 
 
 def test_consumer_responds(juju: jubilant.Juju) -> None:
-    """Wait for the consumer to respond with <job>: done and ack-<job> on each endpoint."""
+    """Wait for the consumer to respond with <job>: done and ack-<job> on each relation.
+
+    We read from ``scheduler/0`` because ``application-data`` from the scheduler's
+    perspective contains the consumer's app databag. Each ``cron`` relation on the
+    scheduler has a unique ``job-name`` key we use to identify which relation belongs
+    to which job.
+    """
 
     def _all_done() -> bool:
-        for job, endpoint in JOB_ENDPOINTS.items():
-            data = _get_unit_relation_data(juju, f"{APP_CONSUMER}/0", endpoint)
-            if data.get(job) != "done":
-                return False
-        return True
+        all_rel_data = _get_all_remote_app_data_by_endpoint(
+            juju, f"{APP_SCHEDULER}/0", "cron"
+        )
+        done_jobs = set()
+        for rel_data in all_rel_data:
+            job = rel_data.get("job-name")
+            if job and rel_data.get(job) == "done":
+                done_jobs.add(job)
+        return done_jobs == set(JOBS)
 
     responded = _poll(_all_done, description="all jobs done in consumer databag")
     assert responded, "Mock consumer did not report all jobs done within the timeout."
 
-    for job, endpoint in JOB_ENDPOINTS.items():
-        data = _get_unit_relation_data(juju, f"{APP_CONSUMER}/0", endpoint)
-        assert data.get(job) == "done", f"consumer missing {job}=done on {endpoint}"
-        assert f"ack-{job}" in data, f"consumer missing ack-{job} on {endpoint}"
-        logger.info(
-            "[%s] %s=%s, ack-%s=%s",
-            endpoint, job, data.get(job), job, data.get(f"ack-{job}"),
-        )
+    all_rel_data = _get_all_remote_app_data_by_endpoint(
+        juju, f"{APP_SCHEDULER}/0", "cron"
+    )
+    rel_by_job = {d.get("job-name"): d for d in all_rel_data if d.get("job-name")}
+    for job in JOBS:
+        data = rel_by_job.get(job, {})
+        assert data.get(job) == "done", f"consumer missing {job}=done"
+        assert f"ack-{job}" in data, f"consumer missing ack-{job}"
+        logger.info("[%s] %s=%s, ack-%s=%s", job, job, data.get(job), job, data.get(f"ack-{job}"))
 
