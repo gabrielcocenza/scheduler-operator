@@ -17,30 +17,24 @@ sequenceDiagram
     participant Scheduler as scheduler charm
     participant APSched as APScheduler daemon
 
-    rect rgb(220, 235, 255)
-        note over Consumer,APSched: Phase 1 — Job registration
-        Consumer->>Juju: relation-set --app job-name="backup" cron="0 2 * * *"
-        Juju->>Scheduler: cron-relation-changed
-        Scheduler->>APSched: writes jobs.json, restarts service
-    end
+    note over Consumer,APSched: Phase 1 — Job registration
+    Consumer->>Juju: relation-set --app job-name="backup" cron="0 2 * * *"
+    Juju->>Scheduler: cron-relation-changed
+    Scheduler->>APSched: writes jobs.json, restarts service
 
-    rect rgb(220, 255, 225)
-        note over Consumer,APSched: Phase 2 — Scheduled execution (02:00 UTC)
-        APSched->>Juju: relation-set --app trigger-backup="2026-05-08T02:00:00+00:00"
-        Juju->>Consumer: cron-relation-changed (ALL units)
-        note over Consumer: leader reads trigger-backup, compares vs ack-backup, runs job
-        Consumer->>Juju: relation-set --app backup="done" ack-backup="2026-05-08T02:00:00+00:00"
-        Juju->>Scheduler: cron-relation-changed
-        note over Scheduler: reads backup="done", logs completion
-    end
+    note over Consumer,APSched: Phase 2 — Scheduled execution (02:00 UTC)
+    APSched->>Juju: relation-set --app trigger-backup="2026-05-08T02:00:00+00:00"
+    Juju->>Consumer: cron-relation-changed (ALL units)
+    note over Consumer: leader reads trigger-backup, compares vs ack-backup, runs job
+    Consumer->>Juju: relation-set --app backup="done" ack-backup="2026-05-08T02:00:00+00:00"
+    Juju->>Scheduler: cron-relation-changed
+    note over Scheduler: reads backup="done", logs completion
 
-    rect rgb(255, 235, 220)
-        note over Consumer,APSched: Retry path (if job fails)
-        Consumer->>Juju: relation-set --app backup="retry" ack-backup="2026-05-08T02:00:00+00:00"
-        Juju->>Scheduler: cron-relation-changed
-        Scheduler->>Juju: relation-set --app trigger-backup="2026-05-08T02:00:01+00:00"
-        Juju->>Consumer: cron-relation-changed (ALL units) — retry loop
-    end
+    note over Consumer,APSched: Retry path (if job fails)
+    Consumer->>Juju: relation-set --app backup="retry" ack-backup="2026-05-08T02:00:00+00:00"
+    Juju->>Scheduler: cron-relation-changed
+    Scheduler->>Juju: relation-set --app trigger-backup="2026-05-08T02:00:01+00:00"
+    Juju->>Consumer: cron-relation-changed (ALL units) — retry loop
 ```
 
 ## Relation interface: `cron`
