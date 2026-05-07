@@ -6,38 +6,59 @@ implement their own scheduled logic inside that hook.
 
 ## How it works
 
-```
-scheduler unit (machine)          mysql/0 (machine or k8s, same or other model)
-─────────────────────────         ───────────────────────────────────────────────
-APScheduler daemon (systemd)
-  │ fires at 02:00 UTC
-  ▼
-juju-exec → relation-set
-  │  trigger-backup: "2026-…"  ──►  Juju fires cron-relation-changed on mysql/0
-  │                                     _on_cron_relation_changed()
-  │                                       compares trigger-backup vs ack-backup
-  │                                       performs backup
-  │                                       writes backup: done
-  │                                       writes ack-backup: "2026-…"
-  │
-  ◄── scheduler reads backup: done/retry, acts accordingly
+Each cron job is registered as a **separate relation**. One `juju relate` = one job.
+Both sides communicate through **application** databags (not unit databags).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Consumer as mysql (consumer app)
+    participant Juju
+    participant Scheduler as scheduler charm
+    participant APSched as APScheduler daemon
+
+    rect rgb(220, 235, 255)
+        note over Consumer,APSched: Phase 1 — Job registration
+        Consumer->>Juju: relation-set --app job-name="backup" cron="0 2 * * *"
+        Juju->>Scheduler: cron-relation-changed
+        Scheduler->>APSched: writes jobs.json, restarts service
+    end
+
+    rect rgb(220, 255, 225)
+        note over Consumer,APSched: Phase 2 — Scheduled execution (02:00 UTC)
+        APSched->>Juju: relation-set --app trigger-backup="2026-05-08T02:00:00+00:00"
+        Juju->>Consumer: cron-relation-changed (ALL units)
+        note over Consumer: leader reads trigger-backup, compares vs ack-backup, runs job
+        Consumer->>Juju: relation-set --app backup="done" ack-backup="2026-05-08T02:00:00+00:00"
+        Juju->>Scheduler: cron-relation-changed
+        note over Scheduler: reads backup="done", logs completion
+    end
+
+    rect rgb(255, 235, 220)
+        note over Consumer,APSched: Retry path (if job fails)
+        Consumer->>Juju: relation-set --app backup="retry" ack-backup="2026-05-08T02:00:00+00:00"
+        Juju->>Scheduler: cron-relation-changed
+        Scheduler->>Juju: relation-set --app trigger-backup="2026-05-08T02:00:01+00:00"
+        Juju->>Consumer: cron-relation-changed (ALL units) — retry loop
+    end
 ```
 
 ## Relation interface: `cron`
 
 The scheduler charm **provides** the `cron` relation (interface: `cron`).
 
-### Scheduler unit databag (written by the scheduler)
+### Scheduler application databag (written by the scheduler)
 
 | Key | Value |
 |-----|-------|
-| `trigger-<job>` | ISO-8601 UTC timestamp; updated each fire/retry; changing it causes Juju to dispatch `cron-relation-changed` on the consumer |
+| `trigger-<job>` | ISO-8601 UTC timestamp; updated each fire/retry; changing it causes Juju to dispatch `cron-relation-changed` on **all** consumer units |
 
-### Consumer unit databag (written by the consuming charm)
+### Consumer application databag (written by the consuming charm leader)
 
 | Key | Value |
 |-----|-------|
-| `jobs` | JSON dict: `{"job-name": "cron-expr", …}` using standard 5-field cron |
+| `job-name` | Logical name of the scheduled job (string) |
+| `cron` | Standard 5-field cron expression (string) |
 | `<job>` | `"done"` \| `"retry"` – the consumer's decision after each trigger |
 | `ack-<job>` | The `trigger-<job>` timestamp the consumer is responding to; used to detect which jobs have newly fired |
 
@@ -48,8 +69,10 @@ immediately set a new `trigger-<job>` timestamp, re-triggering
 
 ### Example consuming charm handler
 
+> **One relation = one job.** Each `juju relate` call registers a single named job.
+> To schedule multiple jobs, create multiple relations.
+
 ```python
-import json
 import ops
 
 
@@ -60,42 +83,45 @@ class MyCharm(ops.CharmBase):
         self.framework.observe(self.on.cron_relation_changed, self._on_cron_relation_changed)
 
     def _on_cron_relation_joined(self, event: ops.RelationJoinedEvent) -> None:
-        event.relation.data[self.unit]["jobs"] = json.dumps({
-            "backup": "0 2 * * *",   # every day at 02:00 UTC
-            "vacuum": "0 6 * * *",   # every day at 06:00 UTC
-        })
+        # Write to the APPLICATION databag (leader only writes; Juju handles that).
+        # One relation carries exactly one job: set job-name and cron as separate keys.
+        if self.unit.is_leader():
+            event.relation.data[self.app]["job-name"] = "backup"
+            event.relation.data[self.app]["cron"] = "0 2 * * *"  # every day at 02:00 UTC
 
     def _on_cron_relation_changed(self, event: ops.RelationChangedEvent) -> None:
-        scheduler_units = [u for u in event.relation.units if "scheduler" in u.app.name]
-        for sched_unit in scheduler_units:
-            sched_data = event.relation.data[sched_unit]
-            our_data = event.relation.data[self.unit]
+        # The scheduler writes trigger-<job> to its APPLICATION databag.
+        # Writing to the app databag fires relation-changed on ALL consumer units,
+        # so guard with is_leader() to act only once.
+        if not self.unit.is_leader():
+            return
 
-            for key, trigger_ts in sched_data.items():
-                if not key.startswith("trigger-"):
-                    continue
-                job_name = key[len("trigger-"):]
-                ack_key = f"ack-{job_name}"
+        scheduler_app = event.app  # the remote application (scheduler)
+        sched_data = event.relation.data[scheduler_app]
+        our_data = event.relation.data[self.app]
 
-                if our_data.get(ack_key) == trigger_ts:
-                    continue  # already processed this trigger
+        for key, trigger_ts in sched_data.items():
+            if not key.startswith("trigger-"):
+                continue
+            job_name = key[len("trigger-"):]
+            ack_key = f"ack-{job_name}"
 
-                # This job has newly fired – run it and respond
-                try:
-                    self._run_job(job_name)
-                    our_data[job_name] = "done"
-                except Exception:
-                    our_data[job_name] = "retry"
-                our_data[ack_key] = trigger_ts  # acknowledge this trigger
+            if our_data.get(ack_key) == trigger_ts:
+                continue  # already processed this trigger
+
+            # This job has newly fired – run it and respond
+            try:
+                self._run_job(job_name)
+                our_data[job_name] = "done"
+            except Exception:
+                our_data[job_name] = "retry"
+            our_data[ack_key] = trigger_ts  # acknowledge this trigger
 
     def _run_job(self, job_name: str) -> None:
         if job_name == "backup":
             self._do_backup()
-        elif job_name == "vacuum":
-            self._do_vacuum()
 
     def _do_backup(self): ...
-    def _do_vacuum(self): ...
 ```
 
 ## Deployment
